@@ -16,7 +16,7 @@ from qoqo import operations as ops
 from braket.aws.aws_session import AwsSession
 from numpy import testing as npt
 from qoqo import measurements
-
+import time
 import os
 
 os.environ["AWS_REGION"] = "eu-west-2"
@@ -44,10 +44,13 @@ queued = backend.run_measurement_registers_hybrid_queued(measurement)
 
 i = 0
 while queued.poll_result() is None:
+    print(f"Waiting for job to complete. {i*10} seconds")
     i += 1
+    time.sleep(10)
     if i > 50:
         raise RuntimeError("Timed out waiting for job to complete")
 (bit_res, _, _) = queued.poll_result()
+queued.delete_tmp_folder()
 
 registers = bit_res["ro"]
 

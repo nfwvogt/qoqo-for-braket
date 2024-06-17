@@ -22,6 +22,10 @@ import numpy as np
 from qoqo import measurements
 import tempfile
 import os
+import copy
+import datetime
+import shutil
+import warnings
 
 
 class QueuedCircuitRun:
@@ -180,42 +184,92 @@ class QueuedProgramRun:
             Dict[str, List[List[float]]],
             Dict[str, List[List[complex]]],
         ] = ({}, {}, {})
+        self._queued_circuits_finished = [False] * len(self._queued_circuits)
+        # necessary because for a local run the result may be already ready
+        #  when this QPR is instantiated
+        for i, queued_circuit in enumerate(self._queued_circuits):
+            if queued_circuit.poll_result() is not None:
+                self._queued_circuits_finished[i] = True
         for circuit in self._queued_circuits:
             if circuit._results is not None:
-                self._registers[0].update(circuit._results[0])
-                self._registers[1].update(circuit._results[1])
-                self._registers[2].update(circuit._results[2])
+                for key, value_bools in circuit._results[0].items():
+                    if key in self._registers[0]:
+                        self._registers[0][key].extend(copy.deepcopy(value_bools))
+                    else:
+                        self._registers[0][key] = copy.deepcopy(value_bools)
+                for key, value_floats in circuit._results[1].items():
+                    if key in self._registers[1]:
+                        self._registers[1][key].extend(copy.deepcopy(value_floats))
+                    else:
+                        self._registers[1][key] = copy.deepcopy(value_floats)
+                for key, value_complexes in circuit._results[2].items():
+                    if key in self._registers[2]:
+                        self._registers[2][key].extend(copy.deepcopy(value_complexes))
+                    else:
+                        self._registers[2][key] = copy.deepcopy(value_complexes)
 
     def poll_result(
         self,
     ) -> Optional[
-        Tuple[
-            Dict[str, List[List[bool]]],
-            Dict[str, List[List[float]]],
-            Dict[str, List[List[complex]]],
+        Union[
+            Tuple[
+                Dict[str, List[List[bool]]],
+                Dict[str, List[List[float]]],
+                Dict[str, List[List[complex]]],
+            ],
+            Dict[str, float],
         ]
     ]:
         """Poll the result once.
 
         Returns:
-            Optional[Tuple[Dict[str, List[List[bool]]],
-                           Dict[str, List[List[float]]],
-                           Dict[str, List[List[complex]]],]
-                     ]: Result if all tasks were successful.
+            Optional[
+                Union[
+                    Tuple[
+                        Dict[str, List[List[bool]]],
+                        Dict[str, List[List[float]]],
+                        Dict[str, List[List[complex]]],
+                    ],
+                    Dict[str, float],
+                ]
+            ]: Result if all tasks were successful.
 
         Raises:
             RuntimeError: job failed or cancelled
         """
-        all_finished = [False] * len(self._queued_circuits)
+        # If all are finished, returned the saved results
+        if all(self._queued_circuits_finished):
+            if isinstance(self._measurement, measurements.ClassicalRegister):
+                return self._registers
+            else:
+                return self._measurement.evaluate(
+                    self._registers[0], self._registers[1], self._registers[2]
+                )
         for i, queued_circuit in enumerate(self._queued_circuits):
-            res = queued_circuit.poll_result()
-            if res is not None:
-                self._registers[0].update(res[0])  # add results to bit registers
-                self._registers[1].update(res[1])  # add results to float registers
-                self._registers[2].update(res[2])  # add results to complex registers
-                all_finished[i] = True
+            if not self._queued_circuits_finished[i]:
+                res = queued_circuit.poll_result()
+                if res is not None:
+                    # add results to bit registers
+                    for key, value_bools in res[0].items():
+                        if key in self._registers[0]:
+                            self._registers[0][key].extend(copy.deepcopy(value_bools))
+                        else:
+                            self._registers[0][key] = copy.deepcopy(value_bools)
+                    # add results to float registers
+                    for key, value_floats in res[1].items():
+                        if key in self._registers[1]:
+                            self._registers[1][key].extend(copy.deepcopy(value_floats))
+                        else:
+                            self._registers[1][key] = copy.deepcopy(value_floats)
+                    # add results to complex registers
+                    for key, value_complexes in res[2].items():
+                        if key in self._registers[2]:
+                            self._registers[2][key].extend(copy.deepcopy(value_complexes))
+                        else:
+                            self._registers[2][key] = copy.deepcopy(value_complexes)
+                    self._queued_circuits_finished[i] = True
 
-        if not all(all_finished):
+        if not all(self._queued_circuits_finished):
             return None
         else:
             if isinstance(self._measurement, measurements.ClassicalRegister):
@@ -241,8 +295,8 @@ class QueuedProgramRun:
             measurement_type = "CheatedPauliZProduct"
         elif isinstance(self._measurement, measurements.Cheated):
             measurement_type = "Cheated"
-        elif isinstance(self._measurement, measurements.ClassicalRegisters):
-            measurement_type = "ClassicalRegisters"
+        elif isinstance(self._measurement, measurements.ClassicalRegister):
+            measurement_type = "ClassicalRegister"
         else:
             raise TypeError("Unknown measurement type")
 
@@ -277,9 +331,21 @@ class QueuedProgramRun:
             circ_instance = QueuedCircuitRun.from_json(circuit)
             queued_circuits_deserialised.append(circ_instance)
             if circ_instance._results is not None:
-                registers[0].update(circ_instance._results[0])
-                registers[1].update(circ_instance._results[1])
-                registers[2].update(circ_instance._results[2])
+                for key, value_bools in circ_instance._results[0].items():
+                    if key in registers[0]:
+                        registers[0][key].extend(copy.deepcopy(value_bools))
+                    else:
+                        registers[0][key] = copy.deepcopy(value_bools)
+                for key, value_floats in circ_instance._results[1].items():
+                    if key in registers[1]:
+                        registers[1][key].extend(copy.deepcopy(value_floats))
+                    else:
+                        registers[1][key] = copy.deepcopy(value_floats)
+                for key, value_complexes in circ_instance._results[2].items():
+                    if key in registers[2]:
+                        registers[2][key].extend(copy.deepcopy(value_complexes))
+                    else:
+                        registers[2][key] = copy.deepcopy(value_complexes)
 
         if json_dict["measurement_type"] == "PauliZProduct":
             measurement = measurements.PauliZProduct.from_json(json_dict["measurement"])
@@ -287,8 +353,8 @@ class QueuedProgramRun:
             measurement = measurements.CheatedPauliZProduct.from_json(json_dict["measurement"])
         elif json_dict["measurement_type"] == "Cheated":
             measurement = measurements.Cheated.from_json(json_dict["measurement"])
-        elif json_dict["measurement_type"] == "ClassicalRegisters":
-            measurement = measurements.ClassicalRegisters.from_json(json_dict["measurement"])
+        elif json_dict["measurement_type"] == "ClassicalRegister":
+            measurement = measurements.ClassicalRegister.from_json(json_dict["measurement"])
         else:
             raise TypeError("Unknown measurement type")
 
@@ -301,7 +367,11 @@ class QueuedHybridRun:
     """Queued Result of the running a QuantumProgram with a hybrid job."""
 
     def __init__(
-        self, session: AwsSession, job: Optional[QuantumJob], metadata: Dict[Any, Any]
+        self,
+        session: AwsSession,
+        job: QuantumJob,
+        metadata: Dict[Any, Any],
+        measurement: measurements,
     ) -> None:
         """Initialise the QueuedCircuitRun class.
 
@@ -309,8 +379,9 @@ class QueuedHybridRun:
             session: Braket AwsSession to use
             job: Braket QuantumJob to query
             metadata: Additional information about the circuit
+            measurement: The qoqo measurement to be run
         """
-        self._job: Optional[QuantumJob] = job
+        self._job: QuantumJob = job
         self._results: Optional[
             Tuple[
                 Dict[str, List[List[bool]]],
@@ -320,13 +391,7 @@ class QueuedHybridRun:
         ] = None
         self.session = session
         self.internal_metadata = metadata
-        if self._job is not None:
-            self.aws_metadata = self._job.metadata()
-        else:
-            self.aws_metadata = None
-        if isinstance(self._job, LocalQuantumJob()):
-            results = self._job.result()
-            self._results = results
+        self._measurement = measurement
 
     def to_json(self) -> str:
         """Convert self to a json string.
@@ -334,6 +399,17 @@ class QueuedHybridRun:
         Returns:
             str: self as a json string
         """
+        if isinstance(self._measurement, measurements.PauliZProduct):
+            measurement_type = "PauliZProduct"
+        elif isinstance(self._measurement, measurements.CheatedPauliZProduct):
+            measurement_type = "CheatedPauliZProduct"
+        elif isinstance(self._measurement, measurements.Cheated):
+            measurement_type = "Cheated"
+        elif isinstance(self._measurement, measurements.ClassicalRegister):
+            measurement_type = "ClassicalRegister"
+        else:
+            raise TypeError("Unknown measurement type")
+
         results: Optional[Dict[str, Any]] = None
         if self._results is not None:
             results = {}
@@ -345,18 +421,24 @@ class QueuedHybridRun:
         if isinstance(self._job, LocalQuantumJob):
             json_dict = {
                 "type": "QueuedLocalQuantumJob",
-                "arn": None,
+                "arn": self._job.arn,
                 "region": None,
                 "metadata": self.internal_metadata,
                 "results": results,
+                "measurement_type": measurement_type,
+                "measurement": self._measurement.to_json(),
             }
         if isinstance(self._job, AwsQuantumJob):
+            metadata = copy.deepcopy(self.internal_metadata)
+            metadata["createdAt"] = self.internal_metadata["createdAt"].isoformat()
             json_dict = {
                 "type": "QueuedAWSQuantumJob",
                 "arn": self._job.arn,
                 "region": self._job.arn.split(":")[3],
-                "metadata": self.internal_metadata,
+                "metadata": metadata,
                 "results": results,
+                "measurement_type": measurement_type,
+                "measurement": self._measurement.to_json(),
             }
 
         return json.dumps(json_dict)
@@ -373,13 +455,29 @@ class QueuedHybridRun:
         """
         json_dict = json.loads(string)
         if json_dict["type"] == "QueuedLocalQuantumJob":
-            session = None
-            job = None
+            session = AwsSession(boto3.session.Session(region_name=json_dict["region"]))
+            job = LocalQuantumJob(json_dict["arn"])
+            metadata = {}
         elif json_dict["type"] == "QueuedAWSQuantumJob":
             session = AwsSession(boto3.session.Session(region_name=json_dict["region"]))
             job = AwsQuantumJob(json_dict["arn"])
+            metadata = json_dict["metadata"]
+            metadata["createdAt"] = datetime.datetime.fromisoformat(metadata["createdAt"])
 
-        instance = QueuedHybridRun(session=session, job=job, metadata=json_dict["metadata"])
+        if json_dict["measurement_type"] == "PauliZProduct":
+            measurement = measurements.PauliZProduct.from_json(json_dict["measurement"])
+        elif json_dict["measurement_type"] == "CheatedPauliZProduct":
+            measurement = measurements.CheatedPauliZProduct.from_json(json_dict["measurement"])
+        elif json_dict["measurement_type"] == "Cheated":
+            measurement = measurements.Cheated.from_json(json_dict["measurement"])
+        elif json_dict["measurement_type"] == "ClassicalRegister":
+            measurement = measurements.ClassicalRegister.from_json(json_dict["measurement"])
+        else:
+            raise TypeError("Unknown measurement type")
+
+        instance = QueuedHybridRun(
+            session=session, job=job, metadata=metadata, measurement=measurement
+        )
         if json_dict["results"] is not None:
             instance._results = (json_dict["results"], {}, {})
 
@@ -400,29 +498,60 @@ class QueuedHybridRun:
         """Poll the result once.
 
         Returns:
-            Optional[Tuple[Dict[str, List[List[bool]]],
-                           Dict[str, List[List[float]]],
-                           Dict[str, List[List[complex]]],]]: Result if task was successful.
+            Optional[
+                Union[
+                    Tuple[
+                        Dict[str, List[List[bool]]],
+                        Dict[str, List[List[float]]],
+                        Dict[str, List[List[complex]]],
+                    ],
+                    Dict[str, float],
+                ]
+            ]: Result if task was successful.
 
         Raises:
             RuntimeError: job failed or cancelled
         """
         if self._results is not None:
-            return self._results
+            if isinstance(self._measurement, measurements.ClassicalRegister):
+                return self._results
+            else:
+                return self._measurement.evaluate(
+                    self._results[0], self._results[1], self._results[2]
+                )
         else:
-            if isinstance(self._job, AwsQuantumJob()):
-                state = self._job.state()
-                if state == "COMPLETED":
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        jobname = self._job.name
-                        self._job.download_result(tmpdir)
+            state = self._job.state()
+            if state == "COMPLETED":
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    jobname = self._job.name
+                    self._job.download_result(tmpdir)
+                    if isinstance(self._job, AwsQuantumJob):
                         with open(os.path.join(os.path.join(tmpdir, jobname), "output.json")) as f:
                             outputs = json.load(f)
-                        self._results = outputs
-                elif state == "FAILED":
-                    raise RuntimeError("Job has failed on AWS")
-                elif state == "CANCELED":
-                    raise RuntimeError("Job was cancelled by AWS")
+                    elif isinstance(self._job, LocalQuantumJob):
+                        with open(
+                            os.path.join(os.path.join(os.getcwd(), jobname), "output.json")
+                        ) as f:
+                            outputs = json.load(f)
+                    self._results = outputs
+                    if isinstance(self._measurement, measurements.ClassicalRegister):
+                        return self._results
+                    else:
+                        return self._measurement.evaluate(
+                            self._results[0], self._results[1], self._results[2]
+                        )
+            elif state == "FAILED":
+                raise RuntimeError("Job has failed on AWS")
+            elif state == "CANCELED":
+                raise RuntimeError("Job was cancelled by AWS")
             else:
                 return None
-        return self._results
+
+    def delete_tmp_folder(self) -> None:
+        """Delete the folder created by AWS for the LocalQuantumJob."""
+        jobname = self._job.name
+        if isinstance(self._job, LocalQuantumJob) & (self._results is not None):
+            try:
+                shutil.rmtree(os.path.join(os.getcwd(), jobname))
+            except FileNotFoundError:
+                warnings.warn("File is not present, has it already been deleted?", stacklevel=1)

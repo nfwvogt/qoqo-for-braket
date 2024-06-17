@@ -4,6 +4,35 @@ This changelog track changes to the qoqo-for-braket project starting at version 
 
 ## Unpublished
 
+## 0.6.0
+
+* Added iqm_verbatim interface to qoqo_for_braket
+* Added import of the `GarnetDevice` from qoqo_iqm to qoqo_for_braket_devices
+
+## 0.5.0
+
+* Modified `run_measurement_registers_hybrid()` to handle non-ClassicalRegister measurements
+* Added `run_program()`, `run_program_queued()` allowing for multiple runs in one call thanks to a list of lists of parameter values
+
+## 0.4.3
+
+* Fixed overwriting registers bug
+* Fixed missing registers checks from QueuedProgramRun.poll_results()
+
+## 0.4.2
+
+* Fixed ClassicalRegister typo in the Queued classes
+
+## 0.4.1
+
+* Added keys to the config dictionary to allow for correct verbatim mode runs
+* Added LocalQuantumJob functionality for run_measurement_hybrid_queued and QueuedHybridRun
+
+## 0.4.0
+
+* Bugfix for the IonQ interface (VirtualZ for VariableMSXX)
+* Added support using hybrid jobs to completely run QuantumPrograms on the cloud (qoqo QuantumProgram is serailized to json, uploaded in a AwsQuantumJob and deserialized and executed on AWS instance with qoqo and qoqo-for-braket installed from requirements)
+
 ## 0.3.1
 
 * Updated to pyo3 0.20

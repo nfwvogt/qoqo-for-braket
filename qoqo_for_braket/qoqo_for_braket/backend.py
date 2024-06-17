@@ -12,28 +12,31 @@
 
 """Provides the BraketBackend class."""
 
+import json
 import os
 import shutil
 import tempfile
-from typing import Tuple, Dict, List, Any, Optional, Union
-from qoqo import Circuit
-from braket.circuits import Circuit as BraketCircuit
-from qoqo import operations as ops
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
+import numpy as np
 import qoqo_qasm
-from qoqo_for_braket.interface import (
-    rigetti_verbatim_interface,
-    ionq_verbatim_interface,
-    oqc_verbatim_interface,
-)
-import json
-from qoqo_for_braket.post_processing import _post_process_circuit_result
-from qoqo_for_braket.queued_results import QueuedCircuitRun, QueuedProgramRun, QueuedHybridRun
-from braket.aws import AwsQuantumTask, AwsDevice, AwsQuantumTaskBatch, AwsQuantumJob
+from braket.aws import AwsDevice, AwsQuantumJob, AwsQuantumTask, AwsQuantumTaskBatch
+from braket.aws.aws_session import AwsSession
+from braket.circuits import Circuit as BraketCircuit
 from braket.devices import LocalSimulator
 from braket.ir import openqasm
-from braket.aws.aws_session import AwsSession
-import numpy as np
+from braket.jobs.local import LocalQuantumJob
+from qoqo import Circuit, QuantumProgram
+from qoqo import operations as ops
+from qoqo.measurements import ClassicalRegister  # type:ignore
 
+from qoqo_for_braket.interface import (
+    ionq_verbatim_interface,
+    iqm_verbatim_interface,
+    oqc_verbatim_interface,
+    rigetti_verbatim_interface,
+)
+from qoqo_for_braket.post_processing import _post_process_circuit_result
+from qoqo_for_braket.queued_results import QueuedCircuitRun, QueuedHybridRun, QueuedProgramRun
 
 LOCAL_SIMULATORS_LIST: List[str] = ["braket_sv", "braket_dm", "braket_ahs"]
 REMOTE_SIMULATORS_LIST: List[str] = [
@@ -85,6 +88,7 @@ class BraketBackend:
         self.__use_actual_hardware = False
         self.__force_rigetti_verbatim = False
         self.__force_ionq_verbatim = False
+        self.__force_iqm_verbatim = False
         self.__force_oqc_verbatim = False
         self.__max_circuit_length = 100
         self.__max_number_shots = 100
@@ -94,20 +98,27 @@ class BraketBackend:
     def _create_config(self) -> Dict[str, Any]:
         return {
             "device": self.device,
+            "verbatim_mode": self.verbatim_mode,
             "max_shots": self.__max_number_shots,
             "max_circuit_length": self.__max_circuit_length,
             "use_actual_hardware": self.__use_actual_hardware,
             "force_rigetti_verbatim": self.__force_rigetti_verbatim,
+            "force_oqc_verbatim": self.__force_oqc_verbatim,
             "force_ionq_verbatim": self.__force_ionq_verbatim,
+            "force_iqm_verbatim": self.__force_iqm_verbatim,
+            "batch_mode": self.batch_mode,
         }
 
     def _load_config(self, config: Dict[str, Any]) -> None:
         self.device = config["device"]
+        self.verbatim_mode = config["verbatim_mode"]
         self.__max_number_shots = config["max_shots"]
         self.__max_circuit_length = config["max_circuit_length"]
         self.__use_actual_hardware = config["use_actual_hardware"]
         self.__force_rigetti_verbatim = config["force_rigetti_verbatim"]
+        self.__force_oqc_verbatim = config["force_oqc_verbatim"]
         self.__force_ionq_verbatim = config["force_ionq_verbatim"]
+        self.__force_iqm_verbatim = config["force_iqm_verbatim"]
         self.batch_mode = config["batch_mode"]
 
     def allow_use_actual_hardware(self) -> None:
@@ -126,6 +137,11 @@ class BraketBackend:
     def force_ionq_verbatim(self) -> None:
         """Force the use of ionq verbatim. Mostly used for testing purposes."""
         self.__force_ionq_verbatim = True
+        self.verbatim_mode = True
+
+    def force_iqm_verbatim(self) -> None:
+        """Force the use of iqm verbatim. Mostly used for testing purposes."""
+        self.__force_iqm_verbatim = True
         self.verbatim_mode = True
 
     def force_oqc_verbatim(self) -> None:
@@ -180,7 +196,7 @@ class BraketBackend:
     def _run_circuit(
         self,
         circuit: Circuit,
-    ) -> Tuple[AwsQuantumTask, Dict[Any, Any]]:
+    ) -> Tuple[AwsQuantumTask, Dict[str, Any]]:
         """Simulate a Circuit on a AWS backend.
 
         The default number of shots for the simulation is 100.
@@ -193,22 +209,34 @@ class BraketBackend:
             circuit (Circuit): the Circuit to simulate.
 
         Returns:
-            (AwsQuantumTask, {readout})
+            (AwsQuantumTask, {readout, output_registers})
 
         Raises:
             ValueError: Circuit contains multiple ways to set the number of measurements
         """
+        (
+            output_bit_register_dict,
+            output_float_register_dict,
+            output_complex_register_dict,
+        ) = self._set_up_registers(circuit)
         (task_specification, shots, readout) = self._prepare_circuit_for_run(circuit)
         return (
             self.__create_device().run(task_specification, shots=shots),
-            {"readout_name": readout},
+            {
+                "readout_name": readout,
+                "output_registers": (
+                    output_bit_register_dict,
+                    output_float_register_dict,
+                    output_complex_register_dict,
+                ),
+            },
         )
 
     # runs a circuit internally and can be used to produce sync and async results
     def _run_circuits_batch(
         self,
         circuits: List[Circuit],
-    ) -> Tuple[AwsQuantumTaskBatch, List[Dict[Any, Any]]]:
+    ) -> Tuple[AwsQuantumTaskBatch, List[Dict[str, Any]]]:
         """Run a list of Circuits on a AWS backend in batch mode.
 
         The default number of shots for the simulation is 100.
@@ -221,19 +249,33 @@ class BraketBackend:
             circuits (List[Circuit]): the Circuits to simulate.
 
         Returns:
-            (AwsQuantumTaskBatch, {readout})
+            (AwsQuantumTaskBatch, {readout, output_registers})
 
         Raises:
             ValueError: Circuit contains multiple ways to set the number of measurements
         """
         task_specifications: List[BraketCircuit] = []
         shots_list = []
-        readouts = []
+        metadata = []
         for circuit in circuits:
             (task_specification, shots, readout) = self._prepare_circuit_for_run(circuit)
+            (
+                output_bit_register_dict,
+                output_float_register_dict,
+                output_complex_register_dict,
+            ) = self._set_up_registers(circuit)
             task_specifications.append(task_specification)
             shots_list.append(shots)
-            readouts.append({"readout_name": readout})
+            metadata.append(
+                {
+                    "readout_name": readout,
+                    "output_registers": (
+                        output_bit_register_dict,
+                        output_float_register_dict,
+                        output_complex_register_dict,
+                    ),
+                }
+            )
         unique_shots = np.unique(shots_list)
         if len(unique_shots) > 1:
             raise ValueError("Circuits contains multiple ways to set the number of measurements")
@@ -241,7 +283,7 @@ class BraketBackend:
             shots = unique_shots[0]
         return (
             self.__create_device().run_batch(task_specifications, shots=int(shots)),
-            readouts,
+            metadata,
         )
 
     def _prepare_circuit_for_run(self, circuit: Circuit) -> Tuple[BraketCircuit, int, str]:
@@ -282,6 +324,8 @@ class BraketBackend:
             task_specification = rigetti_verbatim_interface.call_circuit(circuit)
         elif "ionq" in self.device or self.__force_ionq_verbatim:
             task_specification = ionq_verbatim_interface.call_circuit(circuit)
+        elif "Garnet" in self.device or self.__force_iqm_verbatim:
+            task_specification = iqm_verbatim_interface.call_circuit(circuit)
 
         elif "Lucy" in self.device or self.__force_oqc_verbatim:
             task_specification = oqc_verbatim_interface.call_circuit(circuit)
@@ -289,6 +333,7 @@ class BraketBackend:
         if (
             self.__use_actual_hardware
             or self.__force_ionq_verbatim
+            or self.__force_iqm_verbatim
             or self.__force_oqc_verbatim
             or self.__force_rigetti_verbatim
         ):
@@ -301,6 +346,43 @@ class BraketBackend:
                     "Circuit generated is longer that the max circuit length allowed for hardware"
                 )
         return (task_specification, shots, readout)
+
+    def _set_up_registers(self, circuit: Circuit) -> Tuple[
+        Dict[str, List[List[bool]]],
+        Dict[str, List[List[float]]],
+        Dict[str, List[List[complex]]],
+    ]:
+        """Sets up the output registers for a circuit running on braket.
+
+        Args:
+            circuit (Circuit): The qoqo Circuit for which to prepare the registers.
+
+        Returns:
+            (Dict[str, List[List[bool]]], Dict[str, List[List[float]]],
+             Dict[str, List[List[complex]]]): The output bit register, float
+                                              register and complex register.
+        """
+        output_bit_register_dict: Dict[str, List[List[bool]]] = {}
+        output_float_register_dict: Dict[str, List[List[float]]] = {}
+        output_complex_register_dict: Dict[str, List[List[complex]]] = {}
+
+        for bit_def in circuit.filter_by_tag("DefinitionBit"):
+            # if bit_def.is_output():
+            output_bit_register_dict[bit_def.name()] = []
+
+        for float_def in circuit.filter_by_tag("DefinitionFloat"):
+            # if float_def.is_output():
+            output_float_register_dict[float_def.name()] = cast(List[List[float]], [])
+
+        for complex_def in circuit.filter_by_tag("DefinitionComplex"):
+            # if complex_def.is_output():
+            output_complex_register_dict[complex_def.name()] = cast(List[List[complex]], [])
+
+        return (
+            output_bit_register_dict,
+            output_float_register_dict,
+            output_complex_register_dict,
+        )
 
     def run_circuit(self, circuit: Circuit) -> Tuple[
         Dict[str, List[List[bool]]],
@@ -325,7 +407,11 @@ class BraketBackend:
         """
         (quantum_task, metadata) = self._run_circuit(circuit)
         results = quantum_task.result()
-        return _post_process_circuit_result(results, metadata)
+        (output_bit_register_dict, output_float_register_dict, output_complex_register_dict) = (
+            _post_process_circuit_result(results, metadata)
+        )
+
+        return (output_bit_register_dict, output_float_register_dict, output_complex_register_dict)
 
     def run_circuits_batch(self, circuits: List[Circuit]) -> Tuple[
         Dict[str, List[List[bool]]],
@@ -359,9 +445,21 @@ class BraketBackend:
                 tmp_float_register_dict,
                 tmp_complex_register_dict,
             ) = _post_process_circuit_result(results, metadata)
-            bool_register_dict.update(tmp_bool_register_dict)
-            float_register_dict.update(tmp_float_register_dict)
-            complex_register_dict.update(tmp_complex_register_dict)
+            for key, value_bools in tmp_bool_register_dict.items():
+                if key in bool_register_dict:
+                    bool_register_dict[key].extend(value_bools)
+                else:
+                    bool_register_dict[key] = value_bools
+            for key, value_floats in tmp_float_register_dict.items():
+                if key in float_register_dict:
+                    float_register_dict[key].extend(value_floats)
+                else:
+                    float_register_dict[key] = value_floats
+            for key, value_complexes in tmp_complex_register_dict.items():
+                if key in complex_register_dict:
+                    complex_register_dict[key].extend(value_complexes)
+                else:
+                    complex_register_dict[key] = value_complexes
         return (bool_register_dict, float_register_dict, complex_register_dict)
 
     def run_measurement_registers(self, measurement: Any) -> Tuple[
@@ -402,10 +500,21 @@ class BraketBackend:
                     tmp_float_register_dict,
                     tmp_complex_register_dict,
                 ) = self.run_circuit(run_circuit)
-
-                output_bit_register_dict.update(tmp_bit_register_dict)
-                output_float_register_dict.update(tmp_float_register_dict)
-                output_complex_register_dict.update(tmp_complex_register_dict)
+                for key, value_bools in tmp_bit_register_dict.items():
+                    if key in output_bit_register_dict:
+                        output_bit_register_dict[key].extend(value_bools)
+                    else:
+                        output_bit_register_dict[key] = value_bools
+                for key, value_floats in tmp_float_register_dict.items():
+                    if key in output_float_register_dict:
+                        output_float_register_dict[key].extend(value_floats)
+                    else:
+                        output_float_register_dict[key] = value_floats
+                for key, value_complexes in tmp_complex_register_dict.items():
+                    if key in output_complex_register_dict:
+                        output_complex_register_dict[key].extend(value_complexes)
+                    else:
+                        output_complex_register_dict[key] = value_complexes
 
         return (
             output_bit_register_dict,
@@ -413,10 +522,13 @@ class BraketBackend:
             output_complex_register_dict,
         )
 
-    def run_measurement_registers_hybrid(self, measurement: Any) -> Tuple[
-        Dict[str, List[List[bool]]],
-        Dict[str, List[List[float]]],
-        Dict[str, List[List[complex]]],
+    def run_measurement_registers_hybrid(self, measurement: Any) -> Union[
+        Tuple[
+            Dict[str, List[List[bool]]],
+            Dict[str, List[List[float]]],
+            Dict[str, List[List[complex]]],
+        ],
+        Dict[str, float],
     ]:
         """Run all circuits of a measurement with the AWS Braket backend using hybrid jobs.
 
@@ -426,16 +538,29 @@ class BraketBackend:
             measurement: The measurement that is run.
 
         Returns:
-            Tuple[Dict[str, List[List[bool]]],
-                  Dict[str, List[List[float]]],
-                  Dict[str, List[List[complex]]]]
+            Union[
+                Tuple[
+                    Dict[str, List[List[bool]]],
+                    Dict[str, List[List[float]]],
+                    Dict[str, List[List[complex]]],
+                ],
+                Dict[str, float],
+            ]
         """
         job = self._run_measurement_registers_hybrid(measurement)
         with tempfile.TemporaryDirectory() as tmpdir:
             jobname = job.name
-            job.download_result(tmpdir)
-            with open(os.path.join(os.path.join(tmpdir, jobname), "output.json")) as f:
-                outputs = json.load(f)
+            job.download_result(extract_to=tmpdir)
+            if isinstance(job, AwsQuantumJob):
+                with open(os.path.join(os.path.join(tmpdir, jobname), "output.json")) as f:
+                    outputs = json.load(f)
+            elif isinstance(job, LocalQuantumJob):
+                with open(os.path.join(os.path.join(os.getcwd(), jobname), "output.json")) as f:
+                    outputs = json.load(f)
+                shutil.rmtree(os.path.join(os.getcwd(), jobname))
+            if not isinstance(measurement, ClassicalRegister):
+                outputs = measurement.evaluate(outputs[0], outputs[1], outputs[2])
+
         return outputs
 
     def run_measurement_registers_hybrid_queued(self, measurement: Any) -> QueuedHybridRun:
@@ -447,28 +572,28 @@ class BraketBackend:
             measurement: The measurement that is run.
 
         Returns:
-            QueuedQuantumProgramHybrid
+            QueuedHybridRun
         """
-        job = self._run_measurement_registers_hybrid(measurement)
-        return QueuedHybridRun(self.aws_session, job, job.metadata())
+        job = self._run_measurement_registers_hybrid(measurement, wait_until_complete=False)
+        return QueuedHybridRun(self.aws_session, job, job.metadata(), measurement)
 
-    def _run_measurement_registers_hybrid(self, measurement: Any) -> AwsQuantumJob:
+    def _run_measurement_registers_hybrid(
+        self, measurement: Any, wait_until_complete: bool = True
+    ) -> AwsQuantumJob:
         """Run all circuits of a measurement with the AWS Braket backend using hybrid jobs.
 
         Using hybrid jobs allows us to naturally group the circuits from a measurement.
 
         Args:
             measurement: The measurement that is run.
+            wait_until_complete: Whether to wait for the job to complete.\
+                Should be False when using queued runs.
 
         Returns:
-            Tuple[Dict[str, List[List[bool]]],
-                  Dict[str, List[List[float]]],
-                  Dict[str, List[List[complex]]]]
+            AwsQuantumJob
         """
         # get path of this file
         file_path = os.path.dirname(os.path.realpath(__file__))
-        # get path of the requirements.txt file
-        requirements_path = os.path.join(file_path, "qoqo_requirements.txt")
         measurement_json = measurement.to_json()
         helper_file_path = os.path.join(file_path, "qoqo_hybrid_helper.py")
         # create named temporary directory with tempfile
@@ -476,21 +601,36 @@ class BraketBackend:
         shutil.copyfile(
             helper_file_path, os.path.join("_tmp_hybrid_helper", "qoqo_hybrid_helper.py")
         )
-        shutil.copyfile(requirements_path, os.path.join("_tmp_hybrid_helper", "requirements.txt"))
+        requirement_lines = ["qoqo >= 1.11\n", "qoqo-for-braket >= 0.5"]
+        with open(os.path.join("_tmp_hybrid_helper", "requirements.txt"), "w") as f:
+            # write each line from requirement_lines to separate lines in file
+            f.writelines(requirement_lines)
         with open(".tmp_measurement_input.json", "w") as f:
             f.write(measurement_json)
         with open(".tmp_config_input.json", "w") as f:
             json.dump(self._create_config(), f)
-        job = AwsQuantumJob.create(
-            device=self.device,
-            source_module="_tmp_hybrid_helper",
-            entry_point="_tmp_hybrid_helper.qoqo_hybrid_helper:run_measurement_register",
-            wait_until_complete=True,
-            input_data={
-                "measurement": ".tmp_measurement_input.json",
-                "config": ".tmp_config_input.json",
-            },
-        )
+        device_for_run = self.__create_device()
+        if isinstance(device_for_run, LocalSimulator):
+            job = LocalQuantumJob.create(
+                device=self.device,
+                source_module="_tmp_hybrid_helper",
+                entry_point="_tmp_hybrid_helper.qoqo_hybrid_helper:run_measurement_register",
+                input_data={
+                    "measurement": ".tmp_measurement_input.json",
+                    "config": ".tmp_config_input.json",
+                },
+            )
+        elif isinstance(device_for_run, AwsDevice):
+            job = AwsQuantumJob.create(
+                device=device_for_run._arn,
+                source_module="_tmp_hybrid_helper",
+                entry_point="_tmp_hybrid_helper.qoqo_hybrid_helper:run_measurement_register",
+                wait_until_complete=wait_until_complete,
+                input_data={
+                    "measurement": ".tmp_measurement_input.json",
+                    "config": ".tmp_config_input.json",
+                },
+            )
         shutil.rmtree("_tmp_hybrid_helper")
         os.remove(".tmp_measurement_input.json")
         os.remove(".tmp_config_input.json")
@@ -516,6 +656,63 @@ class BraketBackend:
             output_float_register_dict,
             output_complex_register_dict,
         )
+
+    def run_program(self, program: QuantumProgram, params_values: List[List[float]]) -> Optional[
+        List[
+            Union[
+                Tuple[
+                    Dict[str, List[List[bool]]],
+                    Dict[str, List[List[float]]],
+                    Dict[str, List[List[complex]]],
+                ],
+                Dict[str, float],
+            ]
+        ]
+    ]:
+        """Run a qoqo quantum program on a AWS backend multiple times.
+
+        It can handle QuantumProgram instances containing any kind of measurement. The list of
+        lists of parameters will be used to call `program.run(self, params)` or
+        `program.run_registers(self, params)` as many times as the number of sublists.
+        The return type will change accordingly.
+
+        If no parameters values are provided, a normal call `program.run(self, [])` call
+        will be executed.
+
+        Args:
+            program (QuantumProgram): the qoqo quantum program to run.
+            params_values (List[List[float]]): the parameters values to pass to the quantum
+                program.
+
+        Returns:
+            Optional[
+                List[
+                    Union[
+                        Tuple[
+                            Dict[str, List[List[bool]]],
+                            Dict[str, List[List[float]]],
+                            Dict[str, List[List[complex]]],
+                        ],
+                        Dict[str, float],
+                    ]
+                ]
+            ]: list of dictionaries (or tuples of dictionaries) containing the
+                run results.
+        """
+        returned_results = []
+
+        if isinstance(program.measurement(), ClassicalRegister):
+            if not params_values:
+                returned_results.append(program.run_registers(self, []))
+            for params in params_values:
+                returned_results.append(program.run_registers(self, params))
+        else:
+            if not params_values:
+                returned_results.append(program.run(self, []))
+            for params in params_values:
+                returned_results.append(program.run(self, params))
+
+        return returned_results
 
     def run_circuit_queued(self, circuit: Circuit) -> QueuedCircuitRun:
         """Run a Circuit on a AWS backend and return a queued Job Result.
@@ -560,3 +757,51 @@ class BraketBackend:
 
             queued_circuits.append(self.run_circuit_queued(run_circuit))
         return QueuedProgramRun(measurement, queued_circuits)
+
+    def run_program_queued(
+        self, program: QuantumProgram, params_values: List[List[float]], hybrid: bool = False
+    ) -> List[Union[QueuedProgramRun, QueuedHybridRun]]:
+        """Run a qoqo quantum program on a AWS backend multiple times return a list of queued Jobs.
+
+        This effectively performs the same operations as `run_program` but returns
+        queued results.
+
+        The hybrid parameter can specify whether to run the program in hybrid mode or not.
+
+        Args:
+            program (QuantumProgram): the qoqo quantum program to run.
+            params_values (List[List[float]]): the parameters values to pass to the quantum
+                program.
+            hybrid (bool): whether to run the program in hybrid mode.
+
+        Raises:
+            ValueError: incorrect length of params_values compared to program's input
+                parameter names.
+
+        Returns:
+            List[Union[QueuedProgramRun, QueuedHybridRun]]
+        """
+        queued_runs: List[Union[QueuedProgramRun, QueuedHybridRun]] = []
+        input_parameter_names = program.input_parameter_names()
+
+        if not params_values:
+            if hybrid:
+                queued_runs.append(
+                    self.run_measurement_registers_hybrid_queued(program.measurement())
+                )
+            else:
+                queued_runs.append(self.run_measurement_queued(program.measurement()))
+        for params in params_values:
+            if len(params) != len(input_parameter_names):
+                raise ValueError(
+                    f"Wrong number of parameters {len(input_parameter_names)} parameters"
+                    f" expected {len(params)} parameters given."
+                )
+            substituted_parameters = dict(zip(input_parameter_names, params))
+            measurement = program.measurement().substitute_parameters(substituted_parameters)
+            if hybrid:
+                queued_runs.append(self.run_measurement_registers_hybrid_queued(measurement))
+            else:
+                queued_runs.append(self.run_measurement_queued(measurement))
+
+        return queued_runs
